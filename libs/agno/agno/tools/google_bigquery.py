@@ -1,6 +1,6 @@
 import json
 from os import getenv
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from agno.tools import Toolkit
 from agno.utils.log import log_debug, logger
@@ -8,7 +8,7 @@ from agno.utils.log import log_debug, logger
 try:
     from google.cloud import bigquery
 except ImportError:
-    raise ImportError("`bigquery` not installed. Please install it with google-cloud-bigquery")
+    raise ImportError("`bigquery` not installed. Please install using `pip install google-cloud-bigquery`")
 
 
 class GoogleBigQueryTools(Toolkit):
@@ -23,7 +23,6 @@ class GoogleBigQueryTools(Toolkit):
         credentials: Optional[Any] = None,
         **kwargs,
     ):
-        super().__init__(name="google_bigquery_tools", **kwargs)
         self.project = project or getenv("GOOGLE_CLOUD_PROJECT")
         self.location = location or getenv("GOOGLE_CLOUD_LOCATION")
 
@@ -37,13 +36,15 @@ class GoogleBigQueryTools(Toolkit):
         # Initialize the BQ CLient
         self.client = bigquery.Client(project=self.project, credentials=credentials)
 
-        # Register functions in the toolkit
+        tools: List[Any] = []
         if list_tables:
-            self.register(self.list_tables)
+            tools.append(self.list_tables)
         if describe_table:
-            self.register(self.describe_table)
+            tools.append(self.describe_table)
         if run_sql_query:
-            self.register(self.run_sql_query)
+            tools.append(self.run_sql_query)
+
+        super().__init__(name="google_bigquery_tools", tools=tools, **kwargs)
 
     def list_tables(self) -> str:
         """Use this function to get a list of table names in the dataset.
@@ -105,7 +106,8 @@ class GoogleBigQueryTools(Toolkit):
         try:
             log_debug(f"Running Google SQL |\n{sql}")
             cleaned_query = sql.replace("\\n", " ").replace("\n", "").replace("\\", "")
-            query_job = self.client.query(cleaned_query)
+            job_config = bigquery.QueryJobConfig(default_dataset=f"{self.project}.{self.dataset}")
+            query_job = self.client.query(cleaned_query, job_config)
             results = query_job.result()
             results_str = str([dict(row) for row in results])
             return results_str.replace("\\", "").replace("\n", "")

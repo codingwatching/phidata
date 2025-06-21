@@ -2,11 +2,14 @@ import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
+
 from agno.document import Document
 from agno.embedder import Embedder
-from agno.utils.log import log_debug, log_info, logger
+from agno.utils.log import log_debug, log_info, log_warning, logger
 from agno.vectordb.base import VectorDb
 from agno.vectordb.distance import Distance
+from agno.vectordb.search import SearchType
 
 try:
     from hashlib import md5
@@ -42,6 +45,10 @@ class MongoDb(VectorDb):
         client: Optional[MongoClient] = None,
         search_index_name: Optional[str] = "vector_index_1",
         cosmos_compatibility: Optional[bool] = False,
+        search_type: SearchType = SearchType.vector,
+        hybrid_vector_weight: float = 0.5,
+        hybrid_keyword_weight: float = 0.5,
+        hybrid_rank_constant: int = 60,
         **kwargs,
     ):
         """
@@ -61,6 +68,10 @@ class MongoDb(VectorDb):
             client (Optional[MongoClient]): An existing MongoClient instance.
             search_index_name (str): Name of the search index (default: "vector_index_1")
             cosmos_compatibility (bool): Whether to use Azure Cosmos DB Mongovcore compatibility mode.
+            search_type: The search type to use when searching for documents.
+            hybrid_vector_weight (float): Default weight for vector search results in hybrid search.
+            hybrid_keyword_weight (float): Default weight for keyword search results in hybrid search.
+            hybrid_rank_constant (int): Default rank constant (k) for Reciprocal Rank Fusion in hybrid search. This constant is added to the rank before taking the reciprocal, helping to smooth scores. A common value is 60.
             **kwargs: Additional arguments for MongoClient.
         """
         if not collection_name:
@@ -71,6 +82,10 @@ class MongoDb(VectorDb):
         self.database = database
         self.search_index_name = search_index_name
         self.cosmos_compatibility = cosmos_compatibility
+        self.search_type = search_type
+        self.hybrid_vector_weight = hybrid_vector_weight
+        self.hybrid_keyword_weight = hybrid_keyword_weight
+        self.hybrid_rank_constant = hybrid_rank_constant
 
         if embedder is None:
             from agno.embedder.openai import OpenAIEmbedder
@@ -224,7 +239,7 @@ class MongoDb(VectorDb):
                     log_info(f"Dropping existing index '{index_name}'")
                     collection.drop_index(index_name)
 
-                embedding_dim = getattr(self.embedder, "embedding_dim", 1536)
+                embedding_dim = getattr(self.embedder, "dimensions", 1536)
                 log_info(f"Creating vector search index '{index_name}'")
 
                 # Create vector search index using Cosmos DB IVF format
@@ -271,7 +286,7 @@ class MongoDb(VectorDb):
                     log_info(f"Creating search index '{index_name}'.")
 
                     # Get embedding dimension from embedder
-                    embedding_dim = getattr(self.embedder, "embedding_dim", 1536)
+                    embedding_dim = getattr(self.embedder, "dimensions", 1536)
 
                     search_index_model = SearchIndexModel(
                         definition={
@@ -319,7 +334,7 @@ class MongoDb(VectorDb):
                 collection = await self._get_async_collection()
 
                 # Get embedding dimension from embedder
-                embedding_dim = getattr(self.embedder, "embedding_dim", 1536)
+                embedding_dim = getattr(self.embedder, "dimensions", 1536)
 
                 search_index_model = SearchIndexModel(
                     definition={
@@ -372,8 +387,8 @@ class MongoDb(VectorDb):
         else:
             try:
                 collection = self._get_collection()
-                indexes = list(collection.list_search_indexes()) # type: ignore
-                exists = any(index["name"] == index_name for index in indexes) # type: ignore
+                indexes = list(collection.list_search_indexes())  # type: ignore
+                exists = any(index["name"] == index_name for index in indexes)  # type: ignore
                 return exists
             except Exception as e:
                 logger.error(f"Error checking search index existence: {e}")
@@ -472,7 +487,7 @@ class MongoDb(VectorDb):
 
     def insert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
         """Insert documents into the MongoDB collection."""
-        log_info(f"Inserting {len(documents)} documents")
+        log_debug(f"Inserting {len(documents)} documents")
         collection = self._get_collection()
 
         prepared_docs = []
@@ -519,6 +534,9 @@ class MongoDb(VectorDb):
         self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, min_score: float = 0.0
     ) -> List[Document]:
         """Search for documents using vector similarity."""
+        if self.search_type == SearchType.hybrid:
+            return self.hybrid_search(query, limit=limit, filters=filters)
+
         query_embedding = self.embedder.get_embedding(query)
         if query_embedding is None:
             logger.error(f"Failed to generate embedding for query: {query}")
@@ -602,21 +620,23 @@ class MongoDb(VectorDb):
                     match_filters.update(mongo_filters)
 
                 if match_filters:
-                    pipeline.append({"$match": match_filters}) # type: ignore
+                    pipeline.append({"$match": match_filters})  # type: ignore
 
                 pipeline.append({"$project": {"embedding": 0}})
 
                 results = list(collection.aggregate(pipeline))  # type: ignore
 
-                docs = [
-                    Document(
-                        id=str(doc["_id"]),
-                        name=doc.get("name"),
-                        content=doc["content"],
-                        meta_data={**doc.get("meta_data", {}), "score": doc.get("score", 0.0)},
+                docs = []
+                for doc in results:
+                    # Convert ObjectIds to strings before creating Document
+                    clean_doc = self._convert_objectids_to_strings(doc)
+                    document = Document(
+                        id=str(clean_doc["_id"]),
+                        name=clean_doc.get("name"),
+                        content=clean_doc["content"],
+                        meta_data={**clean_doc.get("meta_data", {}), "score": clean_doc.get("score", 0.0)},
                     )
-                    for doc in results
-                ]
+                    docs.append(document)
 
                 log_info(f"Search completed. Found {len(docs)} documents.")
                 return docs
@@ -653,10 +673,183 @@ class MongoDb(VectorDb):
             logger.error(f"Error during keyword search: {e}")
             return []
 
-    def hybrid_search(self, query: str, limit: int = 5) -> List[Document]:
-        """Perform a hybrid search combining vector and keyword-based searches."""
-        log_debug("Performing hybrid search is not yet implemented.")
-        return []
+    def hybrid_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        """
+        Perform a hybrid search combining vector and keyword-based searches using Reciprocal Rank Fusion.
+
+        Weights for vector and keyword search are configured at the instance level (hybrid_vector_weight, hybrid_keyword_weight).
+        The rank constant k is used in the RRF formula `1 / (rank + k)` to smooth scores.
+
+        Reference: https://www.mongodb.com/docs/atlas/atlas-vector-search/tutorials/reciprocal-rank-fusion
+        """
+
+        if self.cosmos_compatibility:
+            log_warning("Hybrid search is not implemented for Cosmos DB compatibility mode. Returning empty list.")
+            return []
+
+        log_debug(f"Performing hybrid search for query: '{query}' with limit: {limit}")
+
+        query_embedding = self.embedder.get_embedding(query)
+        if query_embedding is None:
+            logger.error(f"Failed to generate embedding for query: {query}")
+            return []
+
+        collection = self._get_collection()
+
+        k = self.hybrid_rank_constant
+        
+        mongo_filters = {}
+        if filters:
+            for key, value in filters.items():
+                # If the key doesn't already include a dot notation for meta_data
+                if not key.startswith("meta_data.") and "." not in key:
+                    mongo_filters[f"meta_data.{key}"] = value
+                else:
+                    mongo_filters[key] = value
+
+        pipeline = [
+            # Vector Search Branch
+            {
+                "$vectorSearch": {
+                    "index": self.search_index_name,
+                    "path": "embedding",
+                    "queryVector": query_embedding,
+                    "numCandidates": min(limit * 10, 200),
+                    "limit": limit * 2,
+                }
+            },
+            {"$group": {"_id": None, "docs": {"$push": "$$ROOT"}}},
+            {"$unwind": {"path": "$docs", "includeArrayIndex": "rank"}},
+            {
+                "$addFields": {
+                    "_id": "$docs._id",
+                    "name": "$docs.name",
+                    "content": "$docs.content",
+                    "meta_data": "$docs.meta_data",
+                    "vs_score": {
+                        "$divide": [
+                            self.hybrid_vector_weight,
+                            {"$add": ["$rank", k, 1]},
+                        ]
+                    },
+                    "fts_score": 0.0,  # Ensure fts_score exists with a default value
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "name": 1,
+                    "content": 1,
+                    "meta_data": 1,
+                    "vs_score": 1,
+                    # Now fts_score is included with its value (0.0 here)
+                    "fts_score": 1,
+                }
+            },
+            # Union with Keyword Search Branch
+            {
+                "$unionWith": {
+                    "coll": self.collection_name,
+                    "pipeline": [
+                        {
+                            "$search": {
+                                "index": "default",
+                                "text": {"query": query, "path": "content"},
+                            }
+                        },
+                        {"$limit": limit * 2},
+                        {"$group": {"_id": None, "docs": {"$push": "$$ROOT"}}},
+                        {"$unwind": {"path": "$docs", "includeArrayIndex": "rank"}},
+                        {
+                            "$addFields": {
+                                "_id": "$docs._id",
+                                "name": "$docs.name",
+                                "content": "$docs.content",
+                                "meta_data": "$docs.meta_data",
+                                "vs_score": 0.0,
+                                "fts_score": {
+                                    "$divide": [
+                                        self.hybrid_keyword_weight,
+                                        {"$add": ["$rank", k, 1]},
+                                    ]
+                                },
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 1,
+                                "name": 1,
+                                "content": 1,
+                                "meta_data": 1,
+                                "vs_score": 1,
+                                "fts_score": 1,
+                            }
+                        },
+                    ],
+                }
+            },
+            # Combine and Rank
+            {
+                "$group": {
+                    "_id": "$_id",
+                    "name": {"$first": "$name"},
+                    "content": {"$first": "$content"},
+                    "meta_data": {"$first": "$meta_data"},
+                    "vs_score": {"$sum": "$vs_score"},
+                    "fts_score": {"$sum": "$fts_score"},
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "name": 1,
+                    "content": 1,
+                    "meta_data": 1,
+                    "score": {"$add": ["$vs_score", "$fts_score"]},
+                }
+            },
+            {"$sort": {"score": -1}},
+            {"$limit": limit},
+        ]
+        
+        # Apply filters if provided
+        if mongo_filters:
+            pipeline.append({"$match": mongo_filters})
+
+        try:
+            results = list(collection.aggregate(pipeline))
+
+            docs = []
+            for doc in results:
+                # Convert ObjectIds to strings before creating Document
+                clean_doc = self._convert_objectids_to_strings(doc)
+                document = Document(
+                    id=str(clean_doc["_id"]),
+                    name=clean_doc.get("name"),
+                    content=clean_doc["content"],
+                    meta_data={**clean_doc.get("meta_data", {}), "score": clean_doc.get("score", 0.0)},
+                )
+                docs.append(document)
+
+            log_info(f"Hybrid search completed. Found {len(docs)} documents.")
+            return docs
+        except errors.OperationFailure as e:
+            logger.error(
+                f"Error during hybrid search, potentially due to missing or misconfigured Atlas Search index for text search: {e}"
+            )
+            logger.error(f"Details: {e.details}")
+            return []
+        except Exception as e:
+            logger.error(f"Error during hybrid search: {e}")
+            import traceback
+
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
 
     def drop(self) -> None:
         """Drop the collection and clean up indexes."""
@@ -711,13 +904,15 @@ class MongoDb(VectorDb):
             try:
                 collection = self._get_collection()
                 result = collection.delete_many({})
-                success = result.deleted_count >= 0  # Consider any deletion (even 0) as success
+                # Consider any deletion (even 0) as success
+                success = result.deleted_count >= 0
                 log_info(f"Deleted {result.deleted_count} documents from collection.")
                 return success
             except Exception as e:
                 logger.error(f"Error deleting documents: {e}")
                 return False
-        return True  # Return True if collection doesn't exist (nothing to delete)
+        # Return True if collection doesn't exist (nothing to delete)
+        return True
 
     def prepare_doc(self, document: Document, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Prepare a document for insertion or upsertion into MongoDB."""
@@ -769,7 +964,7 @@ class MongoDb(VectorDb):
 
     async def async_insert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
         """Insert documents asynchronously."""
-        log_info(f"Inserting {len(documents)} documents asynchronously")
+        log_debug(f"Inserting {len(documents)} documents asynchronously")
         collection = await self._get_async_collection()
 
         prepared_docs = []
@@ -918,3 +1113,24 @@ class MongoDb(VectorDb):
         # Cosmos DB supports: COS (cosine), L2 (Euclidean), IP (inner product)
         metric_mapping = {"cosine": "COS", "euclidean": "L2", "dotProduct": "IP"}
         return metric_mapping.get(self.distance_metric, "COS")
+
+    def _convert_objectids_to_strings(self, obj: Any) -> Any:
+        """
+        Recursively convert MongoDB ObjectIds to strings in any data structure.
+
+        Args:
+            obj: Any object that might contain ObjectIds
+
+        Returns:
+            The same object with ObjectIds converted to strings
+        """
+        if ObjectId and isinstance(obj, ObjectId):
+            return str(obj)
+        elif isinstance(obj, dict):
+            return {key: self._convert_objectids_to_strings(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_objectids_to_strings(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._convert_objectids_to_strings(item) for item in obj)
+        else:
+            return obj
